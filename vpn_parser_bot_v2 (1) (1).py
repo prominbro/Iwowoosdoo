@@ -15,7 +15,7 @@ import os
 import random
 import string
 import tempfile
-from urllib.parse import unquote, parse_qs
+from urllib.parse import unquote, parse_qs, quote
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -134,26 +134,6 @@ def extract_all_keys(text):
     matches = re.finditer(pattern, text)
     return [m.group(0) for m in matches]
 
-# ========== JSON КОНФИГИ ==========
-def parse_json_configs(text):
-    """Парсит JSON и конвертирует в URI через json_to_uri"""
-    uris = []
-    try:
-        data = json.loads(text)
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict):
-                    uri = json_to_uri(item)
-                    if uri:
-                        uris.append(uri)
-        elif isinstance(data, dict):
-            uri = json_to_uri(data)
-            if uri:
-                uris.append(uri)
-    except json.JSONDecodeError:
-        pass
-    return uris
-
 # ========== VMESS ДЕКОДЕР ==========
 def decode_vmess(vmess_url):
     try:
@@ -248,18 +228,19 @@ def parse_proxy_uri(uri):
     except Exception as e:
         return {"error": str(e), "raw": uri}
 
-# ========== ОБРАБОТКА ПОДПИСКИ (3 КЛИЕНТА) ==========
 # ========== КОНВЕРТЕР JSON (Sing-box/v2ray) → URI ==========
 def json_to_uri(obj):
-    """Конвертирует JSON-конфиг sing-box/v2ray в URI"""
+    """Конвертирует JSON-конфиг sing-box/v2ray в URI (один outbound)"""
     try:
         outbounds = obj.get("outbounds", [])
         if not outbounds:
             return None
 
-        # Ищем первый outbound с прокси-протоколом (не freedom/blackhole)
         proxy = None
         for ob in outbounds:
+            tag = ob.get("tag", "")
+            if tag in ("direct", "block", "DIRECT", "BLOCK", "freedom", "blackhole"):
+                continue
             if ob.get("protocol", "") in ("vless", "trojan", "shadowsocks", "vmess"):
                 proxy = ob
                 break
@@ -369,6 +350,75 @@ def json_to_uri(obj):
     except Exception:
         return None
 
+
+def json_to_uris(obj):
+    """
+    Извлекает ВСЕ прокси-outbound's из JSON-конфига и возвращает список URI.
+    Поддерживает конфиги с balancers (много outbounds).
+    """
+    uris = []
+    try:
+        outbounds = obj.get("outbounds", [])
+        if not outbounds:
+            return uris
+
+        remarks = obj.get("remarks", "")
+
+        for ob in outbounds:
+            tag = ob.get("tag", "")
+            protocol = ob.get("protocol", "")
+            # Пропускаем non-proxy
+            if tag in ("direct", "block", "DIRECT", "BLOCK", "freedom", "blackhole"):
+                continue
+            if protocol not in ("vless", "trojan", "shadowsocks", "vmess"):
+                continue
+
+            # Формируем мини-объект для конвертации
+            mini_obj = {
+                "outbounds": [ob],
+                "remarks": remarks
+            }
+            uri = json_to_uri(mini_obj)
+            if uri:
+                # Если remarks нет, используем tag как имя
+                if not remarks and tag:
+                    uri += "#" + quote(tag, safe="")
+                uris.append(uri)
+    except Exception:
+        pass
+    return uris
+
+
+# ========== JSON КОНФИГИ ==========
+def parse_json_configs(text):
+    """Парсит JSON и конвертирует в URI через json_to_uri и json_to_uris"""
+    uris = []
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    # Сначала пробуем извлечь ВСЕ прокси из конфига
+                    extracted = json_to_uris(item)
+                    if extracted:
+                        uris.extend(extracted)
+                    else:
+                        # Fallback — одиночный URI
+                        uri = json_to_uri(item)
+                        if uri:
+                            uris.append(uri)
+        elif isinstance(data, dict):
+            extracted = json_to_uris(data)
+            if extracted:
+                uris.extend(extracted)
+            else:
+                uri = json_to_uri(data)
+                if uri:
+                    uris.append(uri)
+    except json.JSONDecodeError:
+        pass
+    return uris
+
 # ========== ОБРАБОТКА ПОДПИСКИ (FALLBACK) ==========
 def process_subscription(url, custom_hwid=None):
     """
@@ -430,7 +480,7 @@ def process_subscription(url, custom_hwid=None):
         if is_b64:
             text = decoded
         
-        # Извлечение ключей
+        # Извлечение ключей из текста
         keys = extract_all_keys(text)
         for k in keys:
             all_keys.append({"client": client_key, "key": k})
@@ -476,6 +526,7 @@ def process_subscription(url, custom_hwid=None):
         "parsed_configs": all_parsed,
         "errors": errors
     }
+
 def format_result(result):
     lines = []
     lines.append(f"🔗 `{result['url']}`")
